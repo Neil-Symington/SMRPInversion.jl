@@ -16,7 +16,8 @@
 
 using Distributed
 const NCHAINS = 4
-addprocs(max(0, NCHAINS - nworkers()))
+# nworkers() is 1 with no workers (the master counts), so count real workers
+nprocs() - 1 < NCHAINS && addprocs(NCHAINS - (nprocs() - 1))
 @everywhere using Distributed, HiQGA.transD_GP, SMRPInversion
 
 using SNMRForward, PyPlot, Statistics

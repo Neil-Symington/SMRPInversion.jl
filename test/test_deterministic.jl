@@ -90,23 +90,78 @@ end
     @test size(R0) == (nz, nz)
     @test R0 == sparse(1.0I, nz, nz)
 
+    # Default: top cell anchored (a weak minimum-norm pull through the chain
+    # of differences). Row 1 has a single non-zero on the diagonal.
     R1 = transD_GP.makereg(:R1, op)
     @test size(R1) == (nz, nz)
-
-    # Top-cell anchor: row 1 has a single non-zero on the diagonal
-    # (1/sqrt(dz[1])) so the top cell can't drift when β² = 0.
     @test R1[1, 1] ≈ 1.0 / sqrt(dz[1])
     @test count(!iszero, R1[1, :]) == 1
 
-    # For i ≥ 2, row i is the scaled first-difference with weight 1/√dz[i-1].
+    # For i ≥ 2, row i is the scaled first-difference with weight 1/√dz[i-1],
+    # so ‖R1 w‖² ≈ ∫(∂w/∂z)² dz: check on a linear profile w = a z (plus the
+    # anchor term a² z₁²/dz₁ for the default form)
     for i in 2:nz
         @test R1[i, i-1] ≈ -1.0 / sqrt(dz[i-1])
         @test R1[i, i]   ≈  1.0 / sqrt(dz[i-1])
     end
+    a = 0.003
+    wlin = a .* op.S.Fm.zgrid
+    @test norm(R1 * wlin)^2 ≈ a^2 * sum(dz) + (a * op.S.Fm.zgrid[1])^2 / dz[1] rtol = 1e-10
 
     # Deep rows have smaller magnitude than shallow rows (dz grows with
     # depth on a log-growing grid), so the deep smoothness is looser.
     @test abs(R1[2, 2]) > abs(R1[nz, nz])
+
+    # Pure CPC87 form: row 1 zero, constant models in the null space
+    opu = SMRPInversion.SMRDetOperator(sounding; anchor_top = false)
+    R1u = transD_GP.makereg(:R1, opu)
+    @test count(!iszero, R1u[1, :]) == 0
+    @test norm(R1u * ones(nz)) ≈ 0 atol = 1e-12
+    @test norm(R1u * wlin)^2 ≈ a^2 * sum(dz) rtol = 1e-10
+
+    # R2 annihilates linear profiles and is nz × nz
+    R2 = transD_GP.makereg(:R2, op)
+    wlin = a .* op.S.Fm.zgrid
+    @test size(R2) == (nz, nz)
+    @test norm(R2 * wlin) ≈ 0 atol = 1e-10
+    @test norm(R2 * ones(nz)) ≈ 0 atol = 1e-12
+    @test norm(R2 * (op.S.Fm.zgrid .^ 2)) > 0
+end
+
+# ────────────────────────────────────────────────────────────────────────────
+@testset "create_synthetic loop flag and half-side convention" begin
+    zall, znall, zb = transD_GP.setupz(1.0, 1.028; dz=1.0, n=60, showplot=false)
+    q  = 10.0 .^ range(log10(0.1), log10(15.0), length=12) |> collect
+    ct = SNMRForward.ConductivityModel([0.05, 0.05], [500.0])
+    Be, inc = 50_000e-9, deg2rad(-60.0)
+    wshal = zeros(length(zb)); wshal[zb .< 10.0] .= 0.2
+
+    S_sq = SMRPInversion.create_synthetic(wshal, [0.05,0.05], [500.0], Be, inc, 50.0, zb, q;
+                                           square = true, showplot = false, amponly = true, linearsat = true)
+    S_ci = SMRPInversion.create_synthetic(wshal, [0.05,0.05], [500.0], Be, inc, 50.0, zb, q;
+                                           square = false, showplot = false, amponly = true, linearsat = true)
+    Fsq = SNMRForward.MRSForward_square(50.0, zb, q, inc, 0.0, Be, ct)
+    Fci = SNMRForward.MRSForward(50.0, zb, q, inc, Be, ct)
+    @test S_sq.Fm.kernel ≈ Fsq.kernel
+    @test S_ci.Fm.kernel ≈ Fci.kernel
+    @test !(S_sq.Fm.kernel ≈ Fci.kernel)
+
+    # L is the HALF-side: a square loop with L = 50 has the area of a circle
+    # with R = 2L/√π and the two peak responses agree to ~15 % (shape still
+    # matters for a shallow target), while a circle of area L² (R = L/√π),
+    # which is what L = full side would imply, is off by a factor > 2.
+    V_sq  = abs.(SNMRForward.forward(Fsq, wshal))
+    V_eqA = abs.(SNMRForward.forward(SNMRForward.MRSForward(2 * 50.0 / sqrt(pi), zb, q, inc, Be, ct), wshal))
+    V_sm  = abs.(SNMRForward.forward(SNMRForward.MRSForward(50.0 / sqrt(pi), zb, q, inc, Be, ct), wshal))
+    @test isapprox(maximum(V_sq), maximum(V_eqA); rtol = 0.25)
+    @test maximum(V_sq) / maximum(V_sm) > 2.0
+
+    # complex-domain noise is Rician: mean amplitude biased high at low SNR
+    S_c = SMRPInversion.create_synthetic(wshal, [0.05,0.05], [500.0], Be, inc, 50.0, zb, q;
+                                          noise_additive = 1e-3, noise_domain = :complex,
+                                          showplot = false, amponly = true, linearsat = true)
+    @test all(S_c.V0 .>= 0)
+    @test mean(S_c.V0) > 0.5e-3
 end
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -115,16 +170,25 @@ end
     wref   = fill(0.02, n)
     wstart = fill(0.02, n)
 
-    op, mnew, χ², λ², oidx = SMRPInversion.deterministic_invert(
+    r = SMRPInversion.deterministic_invert(
         sounding; wstart = wstart, wref = wref, regtype = :R1)
+    op, mnew, χ², λ², oidx = r
 
     # final iterate
     wfinal    = mnew[end][oidx[end]]
     χ²_final  = χ²[end][oidx[end]]
     target    = length(sounding.V0)
+    @test r.w == wfinal
+    @test r.χ²_final == χ²_final
+    @test r.λ²_final == λ²[end][oidx[end]][1]
 
     # χ² should be within ~10% of target for a well-posed problem
     @test isapprox(χ²_final, target; rtol = 0.1)
+    @test r.converged == (χ²_final <= target * (1 + 1e-2))
+
+    # op.J and op.res are left at the final model
+    @test op.ρ == wfinal
+    @test op.res ≈ abs.(op.K̃ * wfinal) .- sounding.V0
 
     # Solution should live in the physical bounds
     @test all(1e-4 .<= wfinal .<= 0.5)
@@ -178,6 +242,18 @@ end
     @test size(result.Cm) == (n, n)
     @test length(result.σ) == n
     @test result.λ² ≈ float(λ²_final)
+
+    # Resolution matrix: C_m JᵀW²J is not symmetric, so its diagonal can dip
+    # slightly below zero where the regulariser dominates; it should be O(1)
+    # at best and better resolved shallow than deep
+    @test size(result.R) == (n, n)
+    @test all(result.diagR .>= -0.1)
+    @test maximum(result.diagR) <= 1.5
+    @test mean(result.diagR[zbnd .< 30]) > mean(result.diagR[zbnd .> 60])
+
+    # β² enters the Hessian: a positive β² tightens the covariance
+    result_β = SMRPInversion.linearised_posterior_covariance(op, λ²_final; regtype = :R1, β² = 1.0)
+    @test mean(result_β.σ) < mean(result.σ)
 
     # Uncertainty is non-negative and finite everywhere
     @test all(isfinite, result.σ)

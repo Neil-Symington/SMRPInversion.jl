@@ -38,6 +38,32 @@
 # The Σ log σ̂ᵢ² term is constant in (w, s) and dropped from the get_misfit
 # return.
 #
+# References
+# ----------
+# * Hierarchical Bayes treatment of an unknown noise scale:
+#   Malinverno & Briggs (2004), Geophysics 69, 1005–1016;
+#   Malinverno & Parker (2006), Geophysics 71, W15–W27.
+# * The same device inside trans-dimensional samplers:
+#   Dettmer, Dosso & Holland (2010), J. Acoust. Soc. Am. 128, 3393–3405;
+#   Bodin, Sambridge, Tkalčić, Arroucau, Gallagher & Rawlinson (2012),
+#   JGR 117, B02301; Sambridge, Bodin, Gallagher & Tkalčić (2013),
+#   Phil. Trans. R. Soc. A 371, 20110547.
+# * The (N/2)·log s term is ½·log det C_d for C_d = s·diag(σ̂²); dropping it
+#   (profiling) is what biases the ML estimate. Conjugate alternative: a
+#   scaled-inverse-χ² prior on s makes the s-marginal analytic when w is
+#   fixed (Gelman et al. 2013, Bayesian Data Analysis, §2.6, §5.3).
+# * Trans-D GP prior and parallel tempering (HiQGA): Ray & Myer (2019),
+#   GJI 217, 1706–1726; Ray et al. (2013), Geophysics 78, E271–E280.
+#
+# Two caveats to state when reporting results:
+#   • HiQGA tempers the whole misfit, prior term included, so only the T = 1
+#     chain samples the stated posterior (that is the chain used for
+#     inference; hotter chains are mixing aids).
+#   • A scalar s cannot repair a wrong per-gate SHAPE σ̂ᵢ²; use
+#     `σ̂_V0_nV` in `make_synthetic_hierarchical` to test that.
+#   • The Gaussian-in-|V| likelihood is the high-SNR limit of the Rician
+#     amplitude distribution (Rice 1944); see DeterministicInversion.jl.
+#
 # Validation gates (must all pass before any E-rerun uses this module):
 #   V1: fix w to truth, sample s only → posterior brackets truth, width ≈ analytic.
 #   V2: two independent T=1 chains → s posteriors agree.
@@ -111,8 +137,9 @@ function newSMRSoundingHierarchical(V0, ϕ, Fm;
         throw(ArgumentError("V0 and ϕ must have same length"))
     length(σ̂_V0) == length(V0) ||
         throw(ArgumentError("σ̂_V0 must have same length as V0"))
-    amponly && (isapprox(offset_ϕ, 0.0) && isapprox(stretch_ϕ, 1.0)) ||
-        amponly && throw(ArgumentError("amponly requires no phase modification"))
+    if amponly && !(isapprox(offset_ϕ, 0.0) && isapprox(stretch_ϕ, 1.0))
+        throw(ArgumentError("amponly requires no phase modification"))
+    end
     if !amponly
         (σ̂_ϕ === nothing) &&
             throw(ArgumentError("complex-inversion hierarchical requires σ̂_ϕ"))
@@ -206,7 +233,7 @@ end
                                  s_init = 1.0,
                                  rseed = 131,
                                  mult = false, linearsat = true, amponly = true,
-                                 square = false, θ = 0.0)
+                                 square = true, θ = 0.0)
 
 Draw a noisy sounding with additive Gaussian noise of `noise_additive_nV` per
 gate (uniform shape by default), then wrap it in an `SMRSoundingHierarchical`
@@ -228,7 +255,7 @@ function make_synthetic_hierarchical(w, σ, t, Be, ϕ_inc, R, zgrid, qgrid;
                                      mult::Bool = false,
                                      linearsat::Bool = true,
                                      amponly::Bool = true,
-                                     square::Bool = false,
+                                     square::Bool = true,
                                      θ::Real = 0.0)
     noise_V = noise_additive_nV * 1e-9
     S_known = create_synthetic(w, σ, t, Be, ϕ_inc, R, zgrid, qgrid;
