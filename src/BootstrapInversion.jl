@@ -5,9 +5,18 @@
 #                  add to the noise-free forward at the best-fit w0. Standard
 #                  parametric bootstrap; matches the noise model deterministic
 #                  Occam and MCMC already assume.
-#   :residual    — resample the observed residuals `V0 - |K̃·w0|` with
-#                  replacement. Non-parametric; useful when the noise
-#                  distribution is uncertain and you have field data.
+#   :residual    — resample the observed standardised residuals
+#                  (V0 - |K̃·w0|)/σ_V0 with replacement and rescale by σ_V0.
+#                  Non-parametric; useful when the noise distribution is
+#                  uncertain and you have field data.
+#
+# References
+# ----------
+# * Efron (1979), Ann. Statist. 7, 1–26; Efron & Tibshirani (1993), An
+#   Introduction to the Bootstrap, Chapman & Hall, Ch. 6 (parametric) and
+#   Ch. 9 (residual resampling in regression).
+# * Geophysical usage: Tichelaar & Ruff (1989), Eos 70, 593–606;
+#   Aster, Borchers & Thurber (2018) §11.5.
 #
 # Both produce an ensemble of Occam solutions. Their per-depth spread is a
 # non-linear, non-Gaussian uncertainty band directly comparable to
@@ -15,6 +24,13 @@
 # an MCMC p5-p95 credible interval. Where the three agree, the linearised
 # assumption is safe; where bootstrap is wider, non-linearity or multi-modality
 # matters and the linearised band is over-confident.
+#
+# What bootstrap does NOT capture: regularisation (smoothing) bias. Every
+# replicate is a smoothed Occam solution centred on the smoothed `w0`, so
+# where the data have little resolution the band will be narrow and will
+# exclude the truth. Check `diagR` from `linearised_posterior_covariance`
+# or compare against a known synthetic before reading the band as a
+# credible interval.
 #
 # Cost: one Occam per replicate. Occam converges in a few seconds per SMR
 # sounding, so N = 100-200 replicates typically fits in a few minutes.
@@ -28,6 +44,7 @@ export bootstrap_invert
                      N = 200,
                      w0 = nothing,
                      method = :parametric,
+                     noise_domain = :amplitude,
                      rseed = nothing,
                      verbose = false,
                      kwargs...) -> NamedTuple
@@ -43,82 +60,92 @@ Arguments:
              solves the unperturbed problem with `deterministic_invert` and
              uses that solution. Pass a pre-computed best fit to save one
              inversion.
-- `method` : `:parametric` — add fresh Gaussian noise ∼ N(0, σ_V0²) to
-             |K̃·w0| per replicate. Matches the noise model MCMC / linearised
-             assume, so a fair three-way comparison.
-             `:residual` — draw the observed residuals `V0 - |K̃·w0|` with
-             replacement (non-parametric). Useful for field data where the
-             noise is not obviously Gaussian.
+- `method` : `:parametric` — add fresh Gaussian noise ∼ N(0, σ_V0²) per
+             replicate. Matches the noise model MCMC / linearised assume.
+             `:residual` — draw the observed standardised residuals
+             `(V0 - |K̃·w0|)/σ_V0` with replacement, rescale by `σ_V0`
+             (non-parametric, handles the heteroscedastic gates correctly).
              Default `:parametric`.
+- `noise_domain` : `:amplitude` (default) adds Gaussian noise to `|K̃·w0|`;
+             `:complex` adds Gaussian noise of standard deviation `σ_V0` to
+             each quadrature of the complex forward `K̃·w0` and takes the
+             modulus, which gives the physically correct Rician amplitude
+             statistics at low SNR (Rice 1944). Only for `:parametric`.
 - `rseed`  : base seed for reproducibility. If given, replicate `i` uses
              `MersenneTwister(rseed + i)`. If `nothing`, uses the global RNG.
-- `verbose`: log per-replicate progress. Default `false`.
+- `verbose`: log per-replicate progress. Default `false`. HiQGA's own
+             per-iteration log is always switched off inside the replicates.
 - `kwargs...` : forwarded to `deterministic_invert` (`wstart`, `wref`,
-                `regtype`, `β²`, `lo`, `hi`, `λ²min`, `λ²max`, `target`, etc.).
+                `regtype`, `anchor_top`, `β²`, `lo`, `hi`, `λ²min`, `λ²max`,
+                `target`, etc.).
                 **Critical**: pass the SAME `wstart` / `wref` / `regtype` /
                 `β²` you used for the original inversion. Bootstrap
                 characterises noise sensitivity around a fixed regularisation
-                choice, not sensitivity to the prior itself. To probe wref
-                sensitivity, use a B3-style reference-model sweep instead.
+                choice, not sensitivity to the prior itself.
 
 Returns a NamedTuple with:
 - `w0`      : centre model used (either supplied or from the initial fit).
 - `w_reps`  : `(nz × N)` matrix of replicate Occam solutions. Columns
               corresponding to failed inversions are all `NaN`.
-- `n_ok`    : number of replicates that converged.
+- `n_ok`    : number of replicates that ran to completion.
+- `converged_reps` : `(N,)` `Bool`, whether each replicate reached its χ²
+              target (see `deterministic_invert`'s `converged`).
+- `n_converged` : number of replicates that both ran and reached the target.
 - `q05, q50, q95` : per-cell quantiles across successful replicates.
 - `mean_w, std_w` : per-cell mean and standard deviation across replicates.
 - `λ²_reps` : final `λ²` chosen by each replicate's line search — spread
               here is the regularisation-weight sensitivity the linearised
               approach implicitly misses.
 - `χ²_reps` : final `χ²` achieved by each replicate.
-- `method`  : the bootstrap method used, echoed.
+- `method`, `noise_domain` : echoed.
 
 Notes:
 - Bootstrap does not capture `wref` uncertainty (each replicate uses the
-  same reference model). Combine with a B3-style `wref` sweep if you need
-  that.
-- For amplitude-only inversion (the only mode `SMRDetOperator` supports),
-  the noise-free forward is `|K̃·w0|` and bootstrap perturbations are added
-  to that amplitude. Very small perturbations that push individual gates
-  negative are clipped to a tiny positive floor before inversion, as
-  negative amplitudes are unphysical.
-- Each replicate builds its own `SMRDetOperator` (a fresh trapezoidal-
-  weighted kernel copy). Marginal cost — dominated by the inversion itself.
+  same reference model) nor smoothing bias (see module header).
+- For `:amplitude` noise, perturbations that push individual gates negative
+  are clipped to a tiny positive floor before inversion, as negative
+  amplitudes are unphysical; `:complex` noise never needs clipping.
 """
 function bootstrap_invert(S::SMRSoundingKnown;
         N::Int = 200,
         w0::Union{Nothing, AbstractVector} = nothing,
         method::Symbol = :parametric,
+        noise_domain::Symbol = :amplitude,
         rseed::Union{Nothing, Int} = nothing,
         verbose::Bool = false,
         kwargs...)
 
     method in (:parametric, :residual) ||
         throw(ArgumentError("method must be :parametric or :residual, got $method"))
+    noise_domain in (:amplitude, :complex) ||
+        throw(ArgumentError("noise_domain must be :amplitude or :complex, got $noise_domain"))
+
+    # HiQGA's gradientinv log is off in the replicates unless the caller insists
+    kw = merge((; kwargs...), (verbose = false,))
 
     # Solve the unperturbed problem if the caller didn't supply a centre model
     if w0 === nothing
         verbose && @info "bootstrap_invert: solving unperturbed Occam for w0"
-        op0, mnew0, _, _, oidx0 = deterministic_invert(S; kwargs...)
-        w0 = mnew0[end][oidx0[end]]
+        r0 = deterministic_invert(S; kw...)
+        w0 = r0.w
     end
     w0 = collect(Float64, w0)
 
-    # Compute the noise-free forward at w0 via the amplitude operator.
-    # Use S.amponly to confirm the amplitude assumption matches the operator.
+    # Noise-free forward at w0 via the amplitude operator.
     op_ref = SMRDetOperator(S)
     length(w0) == size(op_ref.K̃, 2) ||
         throw(ArgumentError("w0 length ($(length(w0))) must equal kernel column count ($(size(op_ref.K̃, 2)))"))
-    V_hat = abs.(op_ref.K̃ * w0)
+    V_cplx = op_ref.K̃ * w0
+    V_hat  = abs.(V_cplx)
 
-    # Residuals only needed for :residual method
-    residuals = method === :residual ? (S.V0 .- V_hat) : Float64[]
+    # Standardised residuals only needed for :residual method
+    zres = method === :residual ? (S.V0 .- V_hat) ./ S.σ_V0 : Float64[]
 
     nz = length(w0)
     w_reps  = fill(NaN, nz, N)
     λ²_reps = fill(NaN, N)
     χ²_reps = fill(NaN, N)
+    converged_reps = falses(N)
     n_ok = 0
 
     for i in 1:N
@@ -126,22 +153,27 @@ function bootstrap_invert(S::SMRSoundingKnown;
 
         # Generate a bootstrap V0
         if method === :parametric
-            noise_i = randn(rng, length(V_hat)) .* S.σ_V0
+            if noise_domain === :complex
+                n_c = S.σ_V0 .* (randn(rng, length(V_hat)) .+ im .* randn(rng, length(V_hat)))
+                V_boot = abs.(V_cplx .+ n_c)
+            else
+                V_boot = max.(V_hat .+ randn(rng, length(V_hat)) .* S.σ_V0, 1e-30)
+            end
         else
-            idx = rand(rng, 1:length(residuals), length(residuals))
-            noise_i = residuals[idx]
+            idx = rand(rng, 1:length(zres), length(zres))
+            V_boot = max.(V_hat .+ zres[idx] .* S.σ_V0, 1e-30)
         end
-        V_boot = max.(V_hat .+ noise_i, 1e-30)  # clip: negative amplitudes are unphysical
 
         # Build the bootstrap sounding — swap only V0, keep everything else
         S_boot = SMRSoundingKnown(V_boot, S.ϕ, S.σ_V0, S.σ_ϕ, S.Fm,
                                    S.linearsat, S.amponly, S.offset_ϕ, S.stretch_ϕ)
 
         try
-            _, mnew_i, χ²hist_i, λ²hist_i, oidx_i = deterministic_invert(S_boot; kwargs...)
-            w_reps[:, i] = mnew_i[end][oidx_i[end]]
-            λ²_reps[i]   = λ²hist_i[end][oidx_i[end]][1]
-            χ²_reps[i]   = χ²hist_i[end][oidx_i[end]]
+            r = deterministic_invert(S_boot; kw...)
+            w_reps[:, i] = r.w
+            λ²_reps[i]   = r.λ²_final
+            χ²_reps[i]   = r.χ²_final
+            converged_reps[i] = r.converged
             n_ok += 1
             verbose && (i % 25 == 0) && @info "bootstrap_invert: replicate $i / $N done ($n_ok OK)"
         catch e
@@ -154,15 +186,17 @@ function bootstrap_invert(S::SMRSoundingKnown;
     q50    = _rowwise(w_reps, x -> quantile(x, 0.50))
     q95    = _rowwise(w_reps, x -> quantile(x, 0.95))
     mean_w = _rowwise(w_reps, mean)
-    std_w  = _rowwise(w_reps, std)
+    std_w  = _rowwise(w_reps, x -> length(x) > 1 ? std(x) : 0.0)
 
     return (w0 = w0,
             w_reps  = w_reps,
             n_ok    = n_ok,
+            converged_reps = converged_reps,
+            n_converged = count(converged_reps),
             q05     = q05, q50 = q50, q95 = q95,
             mean_w  = mean_w, std_w = std_w,
             λ²_reps = λ²_reps, χ²_reps = χ²_reps,
-            method  = method)
+            method  = method, noise_domain = noise_domain)
 end
 
 # NaN-robust per-row reduction: apply `f` to the non-NaN entries of each row,

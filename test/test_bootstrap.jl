@@ -53,7 +53,11 @@ w0 = mnew0[end][oidx0[end]]
     @test haskey(result, :q05) && haskey(result, :q50) && haskey(result, :q95)
     @test haskey(result, :mean_w) && haskey(result, :std_w)
     @test haskey(result, :λ²_reps) && haskey(result, :χ²_reps)
+    @test haskey(result, :converged_reps) && haskey(result, :n_converged)
     @test result.method == :parametric
+    @test result.noise_domain == :amplitude
+    @test length(result.converged_reps) == N
+    @test result.n_converged == count(result.converged_reps)
 
     # Shapes
     @test length(result.w0) == n
@@ -139,6 +143,18 @@ end
     for i in 1:n
         @test abs(result.mean_w[i] - w0[i]) < max(0.10, 3 * result.std_w[i])
     end
+end
+
+# ────────────────────────────────────────────────────────────────────────────
+@testset "complex-domain parametric bootstrap" begin
+    result = SMRPInversion.bootstrap_invert(
+        sounding; N = 8, w0 = w0, method = :parametric, noise_domain = :complex,
+        rseed = 3, wstart = wstart, wref = wref, regtype = :R1)
+    @test result.noise_domain == :complex
+    @test result.n_ok == 8
+    @test all(result.q05 .<= result.q95)
+    @test_throws ArgumentError SMRPInversion.bootstrap_invert(
+        sounding; N = 2, w0 = w0, noise_domain = :bogus, wstart = wstart, wref = wref)
 end
 
 # ────────────────────────────────────────────────────────────────────────────

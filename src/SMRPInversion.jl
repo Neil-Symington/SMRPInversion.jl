@@ -1,5 +1,24 @@
 # wrapper to integrate SMRPI 1D forward model with
 # HiQGA/transD_GP
+#
+# References
+# ----------
+# * Surface NMR forward kernel, co-/counter-rotating field decomposition and
+#   the complex sounding curve: Weichman, Lavely & Ritzwoller (2000), Phys.
+#   Rev. E 62, 1290–1312; Hertrich (2008), Prog. NMR Spectrosc. 53, 227–248;
+#   Legchenko & Valla (2002), J. Appl. Geophys. 50, 3–19. Kernel implemented
+#   in SNMRForward.jl.
+# * Trans-dimensional Gaussian-process prior and parallel-tempered MCMC used
+#   through HiQGA: Ray & Myer (2019), GJI 217, 1706–1726; Ray, Alumbaugh,
+#   Hoversten & Key (2013), Geophysics 78, E271–E280.
+# * Maximum-likelihood noise scaling (`SMRSoundingUnknown`): the profiled
+#   likelihood ½N·log(rᵀr) follows from integrating a scalar variance out
+#   under a Jeffreys prior — see Malinverno & Briggs (2004), Geophysics 69,
+#   1005–1016. The hierarchical alternative that samples the scale is in
+#   HierarchicalNoise.jl.
+# * Loop convention: `MRSForward_square(L, ...)` takes the HALF-side `L`
+#   (a 100 m square loop is `L = 50`). Verified numerically against a
+#   circular loop of equal area in test/test_deterministic.jl.
 module SMRPInversion
 using HiQGA.transD_GP.AbstractOperator, HiQGA.transD_GP.CommonToAll
 import HiQGA.transD_GP.AbstractOperator.get_misfit
@@ -117,16 +136,44 @@ function get_misfit(w::Vector{<:Real}, S::SMRSounding)
     end
 end
 
+"""
+    create_synthetic(w, σ, t, Be, ϕ, R, zgrid, qgrid; kwargs...) -> SMRSounding
+
+Forward-model a water-content profile `w` (nodal values on `zgrid`) over the
+layered conductivity model `(σ, t)` and add noise.
+
+- `R`      : loop size. For `square = true` (the default) this is the
+             **half-side** of a square loop (100 m loop → `R = 50`); for
+             `square = false` it is the radius of a circular loop.
+- `ϕ`      : Earth-field inclination (rad); `θ`: loop azimuth from magnetic
+             north (rad, square loop only); `Be`: Earth field (T).
+- `noise_domain` : `:amplitude` (default) adds independent Gaussian noise to
+             |V| and to the phase (σ_ϕ = σ_V/|V|), the high-SNR limit.
+             `:complex` adds Gaussian noise of standard deviation `σ_V` to
+             each quadrature of the complex response and takes modulus and
+             angle, which gives the correct Rician amplitude statistics at
+             low SNR (Rice 1944; bias ≈ +14 % at SNR 2).
+- `mult`   : multiplicative (`noise_frac`) rather than additive
+             (`noise_additive`, volts) noise.
+- `noise_mle` : return an `SMRSoundingUnknown` (noise level profiled by ML)
+             instead of an `SMRSoundingKnown`.
+- other keywords as `newSMRSounding`.
+"""
 function create_synthetic(w::Vector{<:Real}, σ::Vector{<:Real}, t::Vector{<:Real},
             Be::Real, ϕ::Real, R::Real, zgrid::Vector{<:Real}, qgrid::Vector{<:Real}
-    ; noise_frac = 0.05, noise_additive = 100e-9, θ = 0., square=false, noise_mle = false, mult = false, linearsat=false,
-    amponly=false, offset_ϕ = 0., stretch_ϕ = 1., showplot=true, rseed=131)
+    ; noise_frac = 0.05, noise_additive = 100e-9, θ = 0., square=true, noise_mle = false, mult = false, linearsat=false,
+    amponly=false, offset_ϕ = 0., stretch_ϕ = 1., showplot=true, rseed=131, noise_domain::Symbol = :amplitude)
     Random.seed!(rseed)
     ct = SNMRForward.ConductivityModel(σ, t)
+    noise_domain in (:amplitude, :complex) ||
+        throw(ArgumentError("noise_domain must be :amplitude or :complex"))
 
+    # NOTE: before Oct 2026 this ternary was inverted (square=false gave the
+    # square loop). The default is now square=true so existing call sites that
+    # relied on the default keep getting a square loop.
     F = (square ?
-        SNMRForward.MRSForward(R, zgrid, qgrid, ϕ, Be, ct) :
-        SNMRForward.MRSForward_square(R, zgrid, qgrid, ϕ, θ, Be, ct))
+        SNMRForward.MRSForward_square(R, zgrid, qgrid, ϕ, θ, Be, ct) :
+        SNMRForward.MRSForward(R, zgrid, qgrid, ϕ, Be, ct))
 
     Vres, ϕres = applynu(F,w, offset_ϕ=offset_ϕ, stretch_ϕ=stretch_ϕ)
     if mult
@@ -136,8 +183,14 @@ function create_synthetic(w::Vector{<:Real}, σ::Vector{<:Real}, t::Vector{<:Rea
         σ_V0 = noise_additive * ones(size(Vres))
         σ_ϕ = noise_additive ./ Vres
     end
-    noisy_V0 = Vres .+ σ_V0 .* randn(size(Vres))
-    noisy_ϕ = ϕres .+ σ_ϕ .* randn(size(Vres))
+    if noise_domain === :complex
+        resp = Vres .* exp.(im .* ϕres) .+ σ_V0 .* (randn(size(Vres)) .+ im .* randn(size(Vres)))
+        noisy_V0 = abs.(resp)
+        noisy_ϕ = angle.(resp)
+    else
+        noisy_V0 = Vres .+ σ_V0 .* randn(size(Vres))
+        noisy_ϕ = ϕres .+ σ_ϕ .* randn(size(Vres))
+    end
 
     if noise_mle
         σ_V0 = nothing
